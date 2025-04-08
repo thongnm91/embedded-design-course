@@ -1,0 +1,198 @@
+/*Includes*/
+#include <stddef.h>
+#include "stm32l1xx.h"
+#include "nucleo152start.h"
+#include <stdio.h>
+
+/*Abstract function*/
+void USART2_Init(void);
+void USART2_write(char data);
+void delay_Ms(int delay);
+void read_dht22_humidity_and_temperature(uint16_t* temp,uint16_t* hum,uint16_t*  c_sum,signed char* minus);
+void delay_us(unsigned long delay);
+void delay_Us(int delay);
+
+/*Main function*/
+int main(void)
+{
+	//Configure the system clock to 32 MHz and update SystemCoreClock
+	SetSysClock();
+	SystemCoreClockUpdate();
+	USART2_Init();
+	//TODO - Add your application code here
+	/*Infinite loop*/
+	uint16_t hum=0,temp=0,c_sum=0;
+	signed char minus = 1;
+	char buf[20]="";
+	char buf2[20]="";
+
+	while (1)
+	{
+		/*dht22_humidity_and_temperature*/
+		read_dht22_humidity_and_temperature(&temp, &hum, &c_sum, &minus); //
+		if(c_sum==0) {
+			sprintf(buf, "cs %d --------\n\r",c_sum);
+		}
+		else sprintf(buf, "cs %d +++++++ \n\r",c_sum);
+
+		uint8_t i = 0;
+		while(buf[i]!='\0'){
+			USART2_write(buf[i]);
+			i++;
+		}
+		i=0; //end of printing
+
+			/*Send result to UART2 debug mode (putty, realterm...)*/
+			uint8_t t=0;
+
+			t=temp%10;
+			sprintf(buf, "temperature: %d,%dC \n\r", (temp/10)*minus,t);
+			while(buf[i]!='\0'){
+				USART2_write(buf[i]);
+				i++;
+			}
+			i=0; //end of temperature
+
+			t=hum%10;
+			sprintf(buf2, "humidity: %d,%d%cRH \n\r",hum/10,t,0x25);
+			while(buf2[i]!='\0'){
+				USART2_write(buf2[i]);
+				i++;
+			}
+			i=0; //end of humidity
+		delay_Ms(1000);
+	}
+	return 0;
+}
+
+void USART2_Init(void)
+{
+	RCC->APB1ENR|=0x00020000;	//set bit 17 (USART2 EN)
+	RCC->AHBENR|=0x00000001;	//enable GPIOA port clock bit 0 (GPIOA EN)
+
+	GPIOA->AFR[0]=0x0000700;	//GPIOx_AFRL p.188, AF7 p.177
+	GPIOA->AFR[0]|=0x00007000;	//GPIOx_AFRL p.188,AF7 p.177
+	GPIOA->MODER|=0x00000020;	//MODER2=PA2(TX) to mode 10=alternate function mode. p184
+	GPIOA->MODER|=0x000000080;	//MODER2=PA3(RX) to mode 10=alternate function mode. p184
+
+	USART2->BRR = 0x00000D05;	//9600 BAUD and crystal 32MHz. p710, D05
+	USART2->CR1 = 0x00000008;	//TE bit. p739-740. Enable transmit
+	USART2->CR1 |= 0x00000004;	//RE bit. p739-740. Enable receiver
+	USART2->CR1 |= 0x00002000;	//UE bit. p739-740. Uart enable
+
+}
+
+void USART2_write(char data)
+{
+	//wait while TX buffer is empty
+	while(!(USART2->SR&0x0080)){}	//TXE:Transmit data register empty. p736-737
+			USART2->DR=(data);		//p739
+}
+
+void delay_Ms(int delay)
+{
+	int i=0;
+	for(; delay>0;delay--)
+		for(i=0;i<2460;i++); //measured with oscilloscope
+}
+
+void delay_Us(int delay)
+{
+	for(int i = 0;i<(delay*2);i++)	//accurate range 10us-100us
+	{
+		asm("mov r0, r0");
+	}
+}
+
+void delay_us(unsigned long delay)
+{
+	unsigned long i = 0;
+	RCC->APB2ENR|=(1<<4); 	//TIM11EN: Time 11 clock enable. p160
+	TIM11->PSC=1;			//32 000 000 MHz / 32 = 1 000 000 Hz. p435
+	TIM11->ARR=1;			//TIM11 counter. 1 000 000 Hz / 1000 = 1000 Hz ~ 1ms. p435
+	TIM11->CNT=0;			//counter start value = 0
+	TIM11->CR1=1;			//TIM11 Counter enabled. p421
+
+	while(i<delay)
+	{
+		while(!((TIM11->SR)&1)){}	//Update interrupt flag. p427
+		i++;
+		TIM11->SR &= ~1;			//flag cleared. p427
+		TIM11->CNT=0;				//counter start value =0
+	}
+	TIM11->CR1=0;					//TIM11 Counter disabled. p421
+}
+
+void read_dht22_humidity_and_temperature(uint16_t* temp,uint16_t* hum,uint16_t*  c_sum, signed char* minus)
+{
+	uint16_t humidity=0x0000, temperature=0x0000; //(16 bits)
+	uint8_t checksum=0x00; //8bits checksum
+	unsigned char i=0;//i: counter the number of a frame (40 bit).
+	*minus=1; //initial alway positive
+
+	/*Start Signal*/
+	RCC->AHBENR|=1; //GPIOA ABH bus clock On.
+	GPIOA->MODER|=0x1000; //GPIOA pin 6 to OUTPUT. p184
+	GPIOA->ODR|=0x40; //0100 0000 set Pin 6 HIGH. p186
+	delay_Ms(1);
+	GPIOA->ODR&=~0x40; //0011 1111 low-state at least 500 us -> Pin 6 LOW
+	delay_Ms(1);
+	GPIOA->ODR|=0x40; //pin 6 high state and sensor gives this 20us-40us -> Pin 6 HIGH
+	delay_Us(40);
+	GPIOA->MODER&=~0x3000; // ~0011 0000 0000 0000 GPIOA pin 6 to INPUT. p184
+
+
+	//wait for response from sensor
+	while((GPIOA->IDR & 0x40)){}//Wait forever until Input Data Register Pin 6 LOW
+	while(!(GPIOA->IDR & 0x40)){}//Wait forever until Input Data Register Pin 6 HIGH
+	while((GPIOA->IDR & 0x40)){}//Wait forever until Input Data Register Pin 6 LOW
+
+	//read values from sensor
+	while(i<40)
+	{
+		while(!(GPIOA->IDR&0x40)){}//Wait forever until Input Data Register Pin 6 HIGH
+		delay_Us(50);
+		/*check if PIN6 still HIGH over 45us, the vol-lengh mean data "1"
+		 * because vol-lengh 26-28us mean "0" and 70us mean "1"
+		 * then it have 80us LOW before next data because "0"or"1" depend on TIME of HIGH.
+		*/
+		if((GPIOA->IDR & 0x40)&&i<16)
+		{
+			humidity|=(0x8000>>i); //if "1" put it from left to right
+
+		}
+		else if((GPIOA->IDR & 0x40) && i>=16 && i<32)
+		{
+			//Check minus temperature
+			if(i==16){
+				*minus=-1; //if first bit "1" mean negative temp datasheet AM2302 p5
+			}
+			temperature|=(0x8000>>(i-16)); //because temp have 16 bit start from 0 so i-16
+		}
+		else if((GPIOA->IDR & 0x40)&&i>=32){
+			checksum|=(0x80>>(i-32)); //because sum have 8 bit start from 0 so i-32
+		}
+		i++;
+		while((GPIOA->IDR & 0x40)){}
+	}
+
+	/*Check sum
+	 * Checksum=(Byte 0+Byte 1+Byte 2+Byte 3)&0xFF
+	 * * The & 0xFF ensures only the least significant 8 bits are considered.
+	 * * if the computed checksum matches Byte 4, the data is valid.
+	 * */
+	uint8_t h_t=0x00, l_t=0x00,h_h=0x00, l_h=0x00,s=0x00;
+	h_t=(temperature>>8); //first byte of temp
+	l_t=(temperature&0x00FF); //second byte of temp
+	h_h=(humidity>>8);
+	l_h=(humidity&0x00FF);
+	s=(h_t+l_t+h_h+l_h)&0xFF;
+	if(s==checksum){
+		*c_sum=checksum;
+	}
+
+	/*Return results*/
+	temperature &= ~(1<<15); //Change first bit to 0
+	*hum=humidity;
+	*temp=temperature;
+}
